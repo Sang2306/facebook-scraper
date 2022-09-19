@@ -26,6 +26,7 @@ from .extractors import (
     extract_group_post,
     extract_post,
     extract_photo_post,
+    extract_story_post,
     PostExtractor,
     extract_hashtag_post,
 )
@@ -48,8 +49,9 @@ class FacebookScraper:
 
     base_url = FB_MOBILE_BASE_URL
     default_headers = {
-        'Accept-Language': 'en-US,en;q=0.5',
-        "Sec-Fetch-User": "?1",
+        "Accept": "*/*",
+        "Connection": "keep-alive",
+        "Accept-Encoding": "gzip,deflate",
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_12_6) AppleWebKit/603.3.8 (KHTML, like Gecko) Version/10.1.2 Safari/603.3.8",
     }
     have_checked_locale = False
@@ -63,8 +65,8 @@ class FacebookScraper:
             requests_kwargs = {}
 
         self.session = session
-        requests_kwargs["params"] = {"locale": "en_US"}
         self.requests_kwargs = requests_kwargs
+        self.request_count = 0
 
     def set_user_agent(self, user_agent):
         self.session.headers["User-Agent"] = user_agent
@@ -126,13 +128,16 @@ class FacebookScraper:
             logger.debug(f"Requesting page from: {url}")
             response = self.get(url)
             options["response_url"] = response.url
-            elem = response.html.find('[data-ft*="top_level_post_id"]', first=True)
-            if not elem:
-                elem = response.html.find('div.async_like', first=True)
             photo_post = False
-            if response.html.find("div.msg", first=True):
-                photo_post = True
-                elem = response.html
+            if "/stories/" in url or "/story/" in url:
+                elem = response.html.find("#story_viewer_content", first=True)
+            else:
+                elem = response.html.find('[data-ft*="top_level_post_id"]', first=True)
+                if not elem:
+                    elem = response.html.find('div.async_like', first=True)
+                if response.html.find("div.msg", first=True):
+                    photo_post = True
+                    elem = response.html
             if not elem:
                 logger.warning("No raw posts (<article> elements) were found in this page.")
             else:
@@ -158,6 +163,15 @@ class FacebookScraper:
                 elif url.startswith(utils.urljoin(FB_MOBILE_BASE_URL, "/groups/")):
                     post.update(
                         extract_group_post(
+                            elem,
+                            request_fn=self.get,
+                            options=options,
+                            full_post_html=response.html,
+                        )
+                    )
+                elif "/stories/" in url or "/story/" in url:
+                    post.update(
+                        extract_story_post(
                             elem,
                             request_fn=self.get,
                             options=options,
@@ -304,13 +318,17 @@ class FacebookScraper:
         if kwargs.get("allow_extra_requests", True):
             logger.debug(f"Requesting page from: {account}")
             response = self.get(account)
-            top_post = response.html.find(
-                '[data-ft*="top_level_post_id"]:not([data-sigil="m-see-translate-link"])',
-                first=True,
-            )
-            result["latest_post_id"] = PostExtractor(
-                top_post, kwargs, self.get
-            ).extract_post_id()["post_id"]
+            try:
+                top_post = response.html.find(
+                    '[data-ft*="top_level_post_id"]:not([data-sigil="m-see-translate-link"])',
+                    first=True,
+                )
+                assert top_post is not None
+                top_post = PostExtractor(top_post, kwargs, self.get).extract_post()
+                top_post.pop("source")
+                result["top_post"] = top_post
+            except Exception as e:
+                logger.error(f"Unable to extract top_post {type(e)}:{e}")
 
             try:
                 result["Friend_count"] = utils.parse_int(
@@ -480,7 +498,7 @@ class FacebookScraper:
            result["id"] = pid
 
         # Likes
-        if result["id"] and kwargs.get("likes"):
+        if result.get("id") and kwargs.get("likes"):
             likes_url = utils.urljoin(
                 FB_MOBILE_BASE_URL,
                 f'timeline/app_section/?section_token={result["id"]}:2409997254',
@@ -610,6 +628,7 @@ class FacebookScraper:
             about_url = f'/{page}/about/'
             logger.debug(f"Requesting page from: {about_url}")
             resp = self.get(about_url)
+            result["name"] = resp.html.find("title", first=True).text.replace(" - About", "")
             desc = resp.html.find("meta[name='description']", first=True)
             result["about"] = resp.html.find(
                 '#pages_msite_body_contents,div.aboutme', first=True
@@ -628,6 +647,8 @@ class FacebookScraper:
             url = f'/{page}/'
             logger.debug(f"Requesting page from: {url}")
             resp = self.get(url)
+            result["id"] = re.search(r'pages/transparency/(\d+)', resp.html.html).group(1)
+            result["name"] = resp.html.find("title", first=True).text.replace(" - Home", "")
             desc = resp.html.find("meta[name='description']", first=True)
             ld_json = None
             try:
@@ -638,11 +659,18 @@ class FacebookScraper:
                 logger.debug(f"Requesting page from: {url}")
                 try:
                     community_resp = self.get(url)
-                    ld_json = community_resp.html.find(
-                        "script[type='application/ld+json']", first=True
-                    ).text
+                    try:
+                        ld_json = community_resp.html.find(
+                            "script[type='application/ld+json']", first=True
+                        ).text
+                    except:
+                        logger.error("No ld+json element")
+                        likes_and_follows = community_resp.html.find(
+                            "#page_suggestions_on_liking+div", first=True
+                        ).text.split("\n")
+                        result["followers"] = utils.convert_numeric_abbr(likes_and_follows[2])
                 except:
-                    logger.error("No ld+json element")
+                    pass
             if ld_json:
                 meta = demjson.decode(ld_json)
                 result.update(meta["author"])
@@ -689,7 +717,10 @@ class FacebookScraper:
             if len(bits) == 3:
                 result["people_talking_about_this"] = utils.parse_int(bits[1])
                 result["checkins"] = utils.parse_int(bits[2])
-        result["reviews"] = self.get_page_reviews(page, **kwargs)
+        if kwargs.get("reviews"):
+            result["reviews"] = self.get_page_reviews(page, **kwargs)
+            if kwargs.get("reviews") != "generator":
+                result["reviews"] = utils.safe_consume(result["reviews"])
 
         return result
 
@@ -702,6 +733,7 @@ class FacebookScraper:
         resp = self.get(url).html
         try:
             url = resp.find("a[href*='?view=info']", first=True).attrs["href"]
+            url += "&sfd=1"  # Add parameter to get full "about"-text
         except AttributeError:
             raise exceptions.UnexpectedResponse("Unable to resolve view=info URL")
         logger.debug(f"Requesting page from: {url}")
@@ -715,55 +747,73 @@ class FacebookScraper:
             result["members"] = utils.parse_int(members.text)
         except AttributeError:
             raise exceptions.UnexpectedResponse("Unable to get one of name, type, or members")
+
+        # Try to extract the group description
+        try:
+            # Directly tageting the weird generated class names is not optimal, but it's the best i could do.
+            about_div = resp.find("._52jc._55wr", first=True)
+
+            # Removing the <wbr>-tags that are converted to linebreaks by .text
+            from requests_html import HTML
+
+            no_word_breaks = HTML(html=about_div.html.replace("<wbr/>", ""))
+
+            result["about"] = no_word_breaks.text
+        except:
+            result["about"] = None
+
         url = members.find("a", first=True).attrs.get("href")
         logger.debug(f"Requesting page from: {url}")
+
         try:
             resp = self.get(url).html
             url = resp.find("a[href*='listType=list_admin_moderator']", first=True)
-            if url:
-                url = url.attrs.get("href")
-                logger.debug(f"Requesting page from: {url}")
-                try:
-                    respAdmins = self.get(url).html
-                except:
-                    raise exceptions.UnexpectedResponse("Unable to get admin list")
-            else:
-                respAdmins = resp
-            # Test if we are a member that can add new members
-            if re.match(
-                "/groups/members/search",
-                respAdmins.find(
-                    "div:nth-child(1)>div:nth-child(1) a:not(.touchable)", first=True
-                ).attrs.get('href'),
-            ):
-                admins = respAdmins.find("div:nth-of-type(2)>div.touchable a:not(.touchable)")
-            else:
-                admins = respAdmins.find("div:first-child>div.touchable a:not(.touchable)")
-            result["admins"] = [
-                {
-                    "name": e.text,
-                    "link": utils.filter_query_params(e.attrs["href"], blacklist=["refid"]),
-                }
-                for e in admins
-            ]
+            if kwargs.get("admins", True):
+                if url:
+                    url = url.attrs.get("href")
+                    logger.debug(f"Requesting page from: {url}")
+                    try:
+                        respAdmins = self.get(url).html
+                    except:
+                        raise exceptions.UnexpectedResponse("Unable to get admin list")
+                else:
+                    respAdmins = resp
+                # Test if we are a member that can add new members
+                if re.match(
+                    "/groups/members/search",
+                    respAdmins.find(
+                        "div:nth-child(1)>div:nth-child(1) a:not(.touchable)", first=True
+                    ).attrs.get('href'),
+                ):
+                    admins = respAdmins.find("div:nth-of-type(2)>div.touchable a:not(.touchable)")
+                else:
+                    admins = respAdmins.find("div:first-child>div.touchable a:not(.touchable)")
+                result["admins"] = [
+                    {
+                        "name": e.text,
+                        "link": utils.filter_query_params(e.attrs["href"], blacklist=["refid"]),
+                    }
+                    for e in admins
+                ]
 
             url = resp.find("a[href*='listType=list_nonfriend_nonadmin']", first=True)
-            if url:
-                url = url.attrs["href"]
-                members = []
-                while url:
-                    logger.debug(f"Requesting page from: {url}")
-                    resp = self.get(url).html
-                    elems = resp.find("#root div.touchable a:not(.touchable)")
-                    members.extend([{"name": e.text, "link": e.attrs["href"]} for e in elems])
-                    more = re.search(r'"m_more_item",href:"([^"]+)', resp.text)
-                    if more:
-                        url = more.group(1)
-                    else:
-                        url = None
-                result["other_members"] = [m for m in members if m not in result["admins"]]
-            else:
-                logger.warning("No other members listed")
+            if kwargs.get("members", True):
+                if url:
+                    url = url.attrs["href"]
+                    members = []
+                    while url:
+                        logger.debug(f"Requesting page from: {url}")
+                        resp = self.get(url).html
+                        elems = resp.find("#root div.touchable a:not(.touchable)")
+                        members.extend([{"name": e.text, "link": e.attrs["href"]} for e in elems])
+                        more = re.search(r'"m_more_item",href:"([^"]+)', resp.text)
+                        if more:
+                            url = more.group(1)
+                        else:
+                            url = None
+                    result["other_members"] = [m for m in members if m not in result["admins"]]
+                else:
+                    logger.warning("No other members listed")
         except exceptions.LoginRequired as e:
             pass
         return result
@@ -814,11 +864,16 @@ class FacebookScraper:
 
     def get(self, url, **kwargs):
         try:
+            self.request_count += 1
             url = str(url)
             if not url.startswith("http"):
                 url = utils.urljoin(FB_MOBILE_BASE_URL, url)
 
-            response = self.session.get(url=url, **self.requests_kwargs, **kwargs)
+            if kwargs.get("post"):
+                kwargs.pop("post")
+                response = self.session.post(url=url, **kwargs)
+            else:
+                response = self.session.get(url=url, **self.requests_kwargs, **kwargs)
             DEBUG = False
             if DEBUG:
                 for filename in os.listdir("."):
@@ -867,6 +922,9 @@ class FacebookScraper:
                 "you can't use this feature right now",
                 "you’re temporarily blocked",
             ]
+            if "checkpoint" in response.url:
+                if response.html.find("h1", containing="We suspended your account"):
+                    raise exceptions.AccountDisabled("Your Account Has Been Disabled")
             if title:
                 if title.text.lower() in not_found_titles:
                     raise exceptions.NotFound(title.text)
@@ -885,12 +943,6 @@ class FacebookScraper:
                     title.text == "Log in to Facebook | Facebook"
                     or response.url.startswith(utils.urljoin(FB_MOBILE_BASE_URL, "login"))
                     or response.url.startswith(utils.urljoin(FB_W3_BASE_URL, "login"))
-                    or (
-                        ", log in to Facebook." in response.text
-                        and not response.html.find(
-                            "article[data-ft],div.async_like[data-ft],div.msg"
-                        )
-                    )
                 ):
                     raise exceptions.LoginRequired(
                         "A login (cookies) is required to see this page"
@@ -953,7 +1005,7 @@ class FacebookScraper:
 
     def is_logged_in(self) -> bool:
         try:
-            self.get('https://m.facebook.com/settings')
+            self.get('https://facebook.com/settings')
             return True
         except exceptions.LoginRequired:
             return False
@@ -1071,3 +1123,22 @@ class FacebookScraper:
                     if remove_source:
                         post.pop('source', None)
                     yield post
+
+    def get_groups_by_search(self, word: str, **kwargs):
+        group_search_url = utils.urljoin(FB_MOBILE_BASE_URL, f"search/groups/?q={word}")
+        r = self.get(group_search_url)
+        for group_element in r.html.find('div[role="button"]'):
+            button_id = group_element.attrs["id"]
+            group_id = self.find_group_id(button_id, r.text)
+            try:
+                yield self.get_group_info(group_id)
+            except AttributeError:
+                continue
+
+    @staticmethod
+    def find_group_id(button_id, raw_html):
+        """Each group button has an id, which appears later in the script
+        tag followed by the group id."""
+        s = raw_html[raw_html.rfind(button_id) :]
+        group_id = s[s.find("result_id:") :].split(",")[0].split(":")[1]
+        return int(group_id)
